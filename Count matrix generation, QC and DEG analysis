@@ -1,0 +1,247 @@
+# GENERAL BULK RNA-SEQ DOWNSTREAM PIPELINE
+# Single script. Replace input placeholders and comparison labels before running.
+# Input counts must be raw, nonnegative, integer gene counts (not TPM/FPKM).
+# Required packages: DESeq2, dplyr, ggplot2. Optional: biomaRt, edgeR, ashr.
+
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+
+setwd("path/to/working_directory")
+output_root <- "RNAseq_results"
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+
+# Read count file: first column = unique gene IDs; remaining columns = samples.
+count <- read.delim("YOUR_RAW_COUNTS.tsv", check.names = FALSE)
+colnames(count)[1] <- "gene_id"
+sample_columns <- names(count)[-1]
+stopifnot(length(sample_columns) > 0, !anyDuplicated(names(count)))
+stopifnot(!anyNA(count$gene_id), all(nzchar(count$gene_id)), !anyDuplicated(count$gene_id))
+count_matrix <- as.matrix(count[, sample_columns, drop = FALSE])
+stopifnot(is.numeric(count_matrix), all(is.finite(count_matrix)),
+          all(count_matrix >= 0), all(count_matrix == floor(count_matrix)))
+
+# Match gene IDs with symbols and biotypes.
+# Supply annotation for YOUR organism, identifier type, and annotation release.
+# Annotation TSV requires gene_id, gene_symbol, gene_biotype; one row per gene_id.
+# Set annotation_file <- NULL to skip annotation and protein-coding filtering.
+annotation_file <- "YOUR_GENE_ANNOTATION.tsv"
+protein_coding_only <- TRUE
+protein_coding_label <- "protein_coding" # Match the spelling in your annotation.
+
+# Optional biomaRt alternative to prepare annotation (replace all placeholders).
+# library(biomaRt)
+# mart <- useEnsembl(biomart = "genes", dataset = "YOUR_ENSEMBL_DATASET")
+# anno <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "gene_biotype"),
+#               filters = "ensembl_gene_id", values = count$gene_id, mart = mart)
+# names(anno) <- c("gene_id", "gene_symbol", "gene_biotype")
+# write.table(anno, "YOUR_GENE_ANNOTATION.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+# Resolve any one-to-many annotation mappings explicitly before continuing.
+# Versioned gene IDs must be reconciled explicitly; IDs are not truncated here.
+
+write_tsv <- function(x, filename) {
+  write.table(x, filename, sep = "\t", row.names = FALSE, quote = FALSE, na = "NA")
+}
+
+if (!is.null(annotation_file)) {
+  anno <- read.delim(annotation_file, check.names = FALSE)
+  stopifnot(all(c("gene_id", "gene_symbol", "gene_biotype") %in% names(anno)))
+  stopifnot(!anyNA(anno$gene_id), all(nzchar(anno$gene_id)), !anyDuplicated(anno$gene_id))
+  anno <- anno[, c("gene_id", "gene_symbol", "gene_biotype")]
+  count <- left_join(count, anno, by = "gene_id")
+} else {
+  if (protein_coding_only) stop("Protein-coding filtering requires annotation")
+  count$gene_symbol <- NA_character_
+  count$gene_biotype <- NA_character_
+}
+write_tsv(count, file.path(output_root, "1_Annotated_counts.tsv"))
+write_tsv(count[is.na(count$gene_biotype), c("gene_id", "gene_symbol")],
+          file.path(output_root, "Unmatched_annotation.tsv"))
+
+# Subset protein-coding genes if requested.
+if (protein_coding_only) {
+  count <- count %>% filter(gene_biotype == protein_coding_label)
+}
+if (!nrow(count)) stop("No genes remain; check annotation and biotype spelling")
+write_tsv(count, file.path(output_root, "2_Selected_gene_counts.tsv"))
+
+# Identify duplicate gene symbols.
+# Retain stable gene IDs for testing: shared symbols need not represent one gene.
+b <- duplicated(count$gene_symbol)
+c <- duplicated(count$gene_symbol, fromLast = TRUE)
+has_symbol <- !is.na(count$gene_symbol) & nzchar(trimws(count$gene_symbol))
+dup <- count[(b | c) & has_symbol, ]
+nondup <- count[!(b | c) & has_symbol, ]
+write_tsv(dup, file.path(output_root, "3_Duplicate_symbol_counts.tsv"))
+write_tsv(nondup, file.path(output_root, "3_Nonduplicate_symbol_counts.tsv"))
+
+# Optional sum of counts by symbol, for descriptive export only.
+# This is not used as DESeq2 input; no gene counts are duplicated by joins.
+count_data <- count %>% filter(!is.na(gene_symbol), nzchar(trimws(gene_symbol))) %>%
+  group_by(gene_symbol) %>%
+  summarise(across(all_of(sample_columns), sum), .groups = "drop")
+write_tsv(count_data, file.path(output_root, "3_Symbol_summed_counts.tsv"))
+
+# Combine with sample metadata.
+# Metadata TSV: SampleID plus phenotype columns (e.g. Condition) and optional Batch.
+count_matrix <- as.matrix(count[, sample_columns, drop = FALSE])
+rownames(count_matrix) <- count$gene_id
+dattrait <- read.delim("YOUR_SAMPLE_METADATA.tsv", check.names = FALSE,
+                       stringsAsFactors = FALSE, na.strings = c("", "NA"))
+stopifnot("SampleID" %in% names(dattrait), !anyNA(dattrait$SampleID),
+          all(nzchar(dattrait$SampleID)), !anyDuplicated(dattrait$SampleID))
+rownames(dattrait) <- dattrait$SampleID
+write_tsv(data.frame(SampleID = setdiff(colnames(count_matrix), rownames(dattrait))),
+          file.path(output_root, "Counts_without_metadata.tsv"))
+write_tsv(data.frame(SampleID = setdiff(rownames(dattrait), colnames(count_matrix))),
+          file.path(output_root, "Metadata_without_counts.tsv"))
+if (!setequal(colnames(count_matrix), rownames(dattrait))) stop("Resolve sample mismatches before analysis")
+count_matrix <- count_matrix[, rownames(dattrait), drop = FALSE]
+stopifnot(identical(colnames(count_matrix), rownames(dattrait)))
+
+# Optional independently justified sample exclusions; no predefined sample IDs.
+exclude_samples <- character(0)
+stopifnot(all(exclude_samples %in% colnames(count_matrix)))
+dattrait <- dattrait[!rownames(dattrait) %in% exclude_samples, , drop = FALSE]
+count_matrix <- count_matrix[, rownames(dattrait), drop = FALSE]
+if (any(colSums(count_matrix) == 0)) stop("A sample has a zero-count library")
+write_tsv(data.frame(SampleID = exclude_samples), file.path(output_root, "Excluded_samples.tsv"))
+write_tsv(data.frame(gene_id = rownames(count_matrix), count_matrix, check.names = FALSE),
+          file.path(output_root, "4_Final_gene_counts.tsv"))
+
+# Define pairwise comparisons; add rows for additional phenotype columns or groups.
+# Positive log2 fold change means higher expression in numerator.
+comparisons <- data.frame(
+  name = "Group_B_vs_Group_A", column = "Condition",
+  numerator = "Group_B", denominator = "Group_A", run = TRUE,
+  stringsAsFactors = FALSE
+)
+use_batch <- TRUE # Set FALSE if no batch adjustment is needed.
+alphas <- c(0.05, 0.01, 0.10)
+fold_changes <- c(1.5, 2) # Minimum-effect tests at alpha 0.05.
+minimum_normalized_sum <- 10 # Editable low-count prefilter, not a universal cutoff.
+run_edger_filter_qc <- FALSE # Optional comparison of filtering, not a package-selection test.
+run_shrinkage <- FALSE      # Set TRUE with ashr installed for effect-size reporting.
+stopifnot(!anyDuplicated(comparisons$name),
+          all(grepl("^[A-Za-z][A-Za-z0-9_-]*$", comparisons$name)))
+if (run_shrinkage && !requireNamespace("ashr", quietly = TRUE)) stop("Install ashr for shrinkage")
+
+# Pairwise DESeq2 analysis
+all_summaries <- list()
+for (i in which(comparisons$run)) {
+  job <- comparisons[i, ]
+  stopifnot(job$column %in% names(dattrait), job$numerator != job$denominator)
+  values <- as.character(dattrait[[job$column]])
+  selected <- !is.na(values) & values %in% c(job$denominator, job$numerator)
+  meta <- dattrait[selected, , drop = FALSE]
+  meta$Group <- factor(values[selected], levels = c(job$denominator, job$numerator))
+  if (any(table(meta$Group) < 2)) stop("At least two biological replicates per group required: ", job$name)
+  counts_sub <- count_matrix[, rownames(meta), drop = FALSE]
+
+  # Independent-sample design; adapt for pairing or additional covariates.
+  design_formula <- ~ Group
+  if (use_batch) {
+    stopifnot("Batch" %in% names(meta), !anyNA(meta$Batch), all(nzchar(trimws(meta$Batch))))
+    meta$Batch <- droplevels(factor(meta$Batch))
+    if (nlevels(meta$Batch) > 1) design_formula <- ~ Batch + Group
+  }
+  mm <- model.matrix(design_formula, meta)
+  if (qr(mm)$rank < ncol(mm)) stop("Confounded or redundant design: ", job$name)
+  if (nrow(mm) <= ncol(mm)) stop("No residual degrees of freedom: ", job$name)
+  outdir <- file.path(output_root, job$name)
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  write_tsv(meta, file.path(outdir, "Sample_metadata.tsv"))
+  write_tsv(data.frame(SampleID = rownames(meta), mm, check.names = FALSE), file.path(outdir, "Design_matrix.tsv"))
+  if (use_batch) write_tsv(as.data.frame(table(meta$Batch, meta$Group)), file.path(outdir, "Batch_by_group.tsv"))
+
+  # Construct DESeq2 dataset and estimate size factors from raw counts.
+  dds <- DESeqDataSetFromMatrix(countData = counts_sub, colData = meta, design = design_formula)
+  dds <- estimateSizeFactors(dds)
+  write_tsv(data.frame(SampleID = colnames(dds), SizeFactor = sizeFactors(dds)),
+            file.path(outdir, "Size_factors.tsv"))
+
+  # Initial low-count QC, retaining the original normalized-sum filter structure.
+  normalized <- counts(dds, normalized = TRUE)
+  filter_qc <- data.frame(Genes_input = nrow(dds),
+                          Genes_nonzero = sum(rowSums(normalized) > 0),
+                          Genes_retained = sum(rowSums(normalized) >= minimum_normalized_sum))
+  write_tsv(filter_qc, file.path(outdir, "Filtering_QC.tsv"))
+  if (run_edger_filter_qc) {
+    if (!requireNamespace("edgeR", quietly = TRUE)) stop("Install edgeR for optional QC")
+    data <- edgeR::DGEList(counts = counts_sub)
+    keep <- edgeR::filterByExpr(data, design = mm)
+    write_tsv(data.frame(gene_id = rownames(counts_sub), edgeR_keep = keep),
+              file.path(outdir, "Optional_edgeR_filter_QC.tsv"))
+  }
+  dds <- dds[rowSums(normalized) >= minimum_normalized_sum, ]
+  if (!nrow(dds)) stop("No genes remain after filtering: ", job$name)
+  dds <- DESeq(dds, test = "Wald", minReplicatesForReplace = Inf)
+  contrast_value <- c("Group", job$numerator, job$denominator)
+
+  # Normalized counts are exported, but raw counts are used for model fitting.
+  write_tsv(data.frame(gene_id = rownames(dds), counts(dds, normalized = TRUE), check.names = FALSE),
+            file.path(outdir, "Normalized_counts.tsv"))
+
+  # PCA on variance-stabilized values; these plots retain modeled batch variation.
+  vsd <- varianceStabilizingTransformation(dds, blind = FALSE)
+  pca <- plotPCA(vsd, intgroup = "Group", returnData = TRUE)
+  variance <- round(100 * attr(pca, "percentVar"), 1)
+  p <- ggplot(pca, aes(PC1, PC2, color = Group)) + geom_point(size = 3) +
+    theme_classic() + labs(x = paste0("PC1 (", variance[1], "%)"), y = paste0("PC2 (", variance[2], "%)"))
+  ggsave(file.path(outdir, "PCA.png"), p, width = 7, height = 5)
+  write_tsv(pca, file.path(outdir, "PCA_scores.tsv"))
+
+  # Optional shrinkage: report separately from original Wald statistics.
+  shrunken <- NULL
+  if (run_shrinkage) {
+    res <- results(dds, contrast = contrast_value)
+    shrunken <- lfcShrink(dds, res = res, type = "ashr")
+  }
+
+  # Significance-only tests and formal minimum-effect tests.
+  # Cook filtering uses DESeq2 defaults; diagnostic values do not auto-exclude samples.
+  settings <- rbind(data.frame(alpha = alphas, fold_change = 1),
+                    data.frame(alpha = 0.05, fold_change = fold_changes))
+  for (j in seq_len(nrow(settings))) {
+    alpha <- settings$alpha[j]
+    fc <- settings$fold_change[j]
+    res <- results(dds, contrast = contrast_value, alpha = alpha,
+                   lfcThreshold = log2(fc), altHypothesis = "greaterAbs")
+    tab <- data.frame(gene_id = rownames(res), as.data.frame(res), row.names = NULL)
+    tab$gene_symbol <- count$gene_symbol[match(tab$gene_id, count$gene_id)]
+    if (!is.null(shrunken)) tab$shrunken_log2FC <- shrunken$log2FoldChange[match(tab$gene_id, rownames(shrunken))]
+    tab$Significant <- !is.na(tab$padj) & tab$padj < alpha
+    up <- tab[tab$Significant & !is.na(tab$log2FoldChange) & tab$log2FoldChange > 0, ]
+    down <- tab[tab$Significant & !is.na(tab$log2FoldChange) & tab$log2FoldChange < 0, ]
+    prefix <- paste0("alpha", alpha, "_FC", fc)
+    write_tsv(tab, file.path(outdir, paste0(prefix, "_All.tsv")))
+    write_tsv(rbind(up, down), file.path(outdir, paste0(prefix, "_Significant.tsv")))
+    write_tsv(up, file.path(outdir, paste0(prefix, "_Up.tsv")))
+    write_tsv(down, file.path(outdir, paste0(prefix, "_Down.tsv")))
+    all_summaries[[length(all_summaries) + 1]] <- data.frame(
+      Comparison = job$name, Numerator = job$numerator, Denominator = job$denominator,
+      Samples = ncol(dds), Genes = nrow(dds), Alpha = alpha, Fold_change = fc,
+      Up = nrow(up), Down = nrow(down))
+  }
+
+  # Save model diagnostics and fitted object.
+  converged <- mcols(dds)$betaConv
+  failed <- which(!is.na(converged) & !converged)
+  write_tsv(data.frame(gene_id = rownames(dds)[failed], betaConv = converged[failed]),
+            file.path(outdir, "Nonconverged_genes.tsv"))
+  cooks <- assays(dds)[["cooks"]]
+  if (!is.null(cooks)) {
+    max_cooks <- apply(cooks, 1, function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE))
+    write_tsv(data.frame(gene_id = rownames(dds), MaxCooks = max_cooks),
+              file.path(outdir, "Cooks_diagnostics.tsv"))
+  }
+  pdf(file.path(outdir, "Dispersion_plot.pdf"))
+  plotDispEsts(dds)
+  dev.off()
+  saveRDS(dds, file.path(outdir, "Fitted_DESeq2.rds"))
+}
+
+if (length(all_summaries)) write_tsv(bind_rows(all_summaries), file.path(output_root, "DEG_summary.tsv"))
+write_tsv(comparisons, file.path(output_root, "Comparisons_used.tsv"))
+capture.output(sessionInfo(), file = file.path(output_root, "Session_info.txt"))
+message("Analysis complete: ", output_root)
